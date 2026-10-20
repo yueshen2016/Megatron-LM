@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Export a GPTModel."""
+
 import functools
 import inspect
 import os
@@ -12,17 +13,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 import modelopt.torch.export as mtex
 import torch
+from model_provider import model_provider
 
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
-from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -53,9 +54,23 @@ def add_modelopt_export_args(parser):
         default=True,
         help="Preserve FP8 KV-cache scales learned during QAT instead of clamping them to 1.0.",
     )
+    group.add_argument(
+        "--export-moe-router-dtype",
+        choices=("model", "fp32", "fp64"),
+        default=None,
+        help="Router checkpoint storage dtype; model uses the export dtype. "
+        "When omitted, preserve the existing router compute-dtype override.",
+    )
     group.add_argument("--export-dir", type=str, help="The target export path.")
     add_modelopt_args(parser)
     return parser
+
+
+def _export_router_dtype(choice: str | None, compute_dtype: str | None) -> str | None:
+    """Choose checkpoint storage precision without changing router compute precision."""
+    if choice == "model":
+        return None
+    return compute_dtype if choice is None else choice
 
 
 if __name__ == "__main__":
@@ -100,7 +115,6 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
 
-
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.
     export_extra_modules = hasattr(unwrapped_model, "eagle_module") or hasattr(
@@ -114,9 +128,13 @@ if __name__ == "__main__":
         "export_extra_modules": export_extra_modules,
         "dtype": torch.bfloat16,
         "export_dir": args.export_dir,
-        "moe_router_dtype": unwrapped_model.config.moe_router_dtype,
+        "moe_router_dtype": _export_router_dtype(
+            args.export_moe_router_dtype, unwrapped_model.config.moe_router_dtype
+        ),
     }
-    export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
+    export_fn = (
+        mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
+    )
 
     if "trust_remote_code" in inspect.signature(export_fn).parameters:
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
